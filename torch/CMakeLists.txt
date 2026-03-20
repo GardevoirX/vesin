@@ -30,6 +30,9 @@ add_subdirectory(vesin)
 
 find_package(Torch 2.3 REQUIRED)
 
+target_compile_definitions(vesin_objects PRIVATE VESIN_TORCH_PROFILER)
+target_link_libraries(vesin_objects PRIVATE torch)
+
 # PyTorch requires passing std::string & co. across DLL boundaries, which fails
 # when using a different runtime library from the one used by torch.dll & co.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
@@ -47,6 +50,7 @@ target_include_directories(vesin_torch PUBLIC
 target_compile_features(vesin_torch PUBLIC cxx_std_17)
 
 target_compile_definitions(vesin_torch PRIVATE VESIN_TORCH_EXPORTS)
+target_compile_definitions(vesin_torch PRIVATE VESIN_TORCH_PROFILER)
 set_target_properties(vesin_torch PROPERTIES
     # hide non-exported symbols by default
     CXX_VISIBILITY_PRESET hidden

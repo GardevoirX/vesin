@@ -8,6 +8,7 @@
 #include <tuple>
 
 #include "cpu_cell_list.hpp"
+#include "profiling.hpp"
 
 using namespace vesin::cpu;
 
@@ -18,6 +19,8 @@ void vesin::cpu::neighbors(
     VesinOptions options,
     VesinNeighborList& raw_neighbors
 ) {
+    VESIN_PROFILE_SCOPE("vesin::cpu::neighbors_impl");
+
     if (options.algorithm == VesinAutoAlgorithm || options.algorithm == VesinCellList) {
         // all good, this is the only thing we implement
     } else {
@@ -26,8 +29,11 @@ void vesin::cpu::neighbors(
 
     auto cell_list = CellList(cell, options.cutoff);
 
-    for (size_t i = 0; i < n_points; i++) {
-        cell_list.add_point(i, points[i]);
+    {
+        VESIN_PROFILE_SCOPE("vesin::cpu::bin_points");
+        for (size_t i = 0; i < n_points; i++) {
+            cell_list.add_point(i, points[i]);
+        }
     }
 
     auto cell_matrix = cell.matrix();
@@ -36,65 +42,71 @@ void vesin::cpu::neighbors(
     // the cell list creates too many pairs, we only need to keep the
     // one where the distance is actually below the cutoff
     auto neighbors = GrowableNeighborList{raw_neighbors, raw_neighbors.length, options};
-    neighbors.reset();
+    {
+        VESIN_PROFILE_SCOPE("vesin::cpu::reset_output");
+        neighbors.reset();
+    }
 
-    cell_list.foreach_pair([&](size_t first, size_t second, CellShift shift) {
-        if (!options.full) {
-            // filter out some pairs for half neighbor lists
-            if (first > second) {
-                return;
-            }
-
-            if (first == second) {
-                // When creating pairs between a point and one of its periodic
-                // images, the code generate multiple redundant pairs (e.g. with
-                // shifts 0 1 1 and 0 -1 -1); and we want to only keep one of
-                // these.
-                if (shift[0] + shift[1] + shift[2] < 0) {
-                    // drop shifts on the negative half-space
+    {
+        VESIN_PROFILE_SCOPE("vesin::cpu::find_pairs");
+        cell_list.foreach_pair([&](size_t first, size_t second, CellShift shift) {
+            if (!options.full) {
+                // filter out some pairs for half neighbor lists
+                if (first > second) {
                     return;
                 }
 
-                if ((shift[0] + shift[1] + shift[2] == 0) && (shift[2] < 0 || (shift[2] == 0 && shift[1] < 0))) {
-                    // drop shifts in the negative half plane or the negative
-                    // shift[1] axis. See below for a graphical representation:
-                    // we are keeping the shifts indicated with `O` and dropping
-                    // the ones indicated with `X`
-                    //
-                    //  O O O │ O O O
-                    //  O O O │ O O O
-                    //  O O O │ O O O
-                    // ─X─X─X─┼─O─O─O─
-                    //  X X X │ X X X
-                    //  X X X │ X X X
-                    //  X X X │ X X X
-                    return;
+                if (first == second) {
+                    // When creating pairs between a point and one of its periodic
+                    // images, the code generate multiple redundant pairs (e.g. with
+                    // shifts 0 1 1 and 0 -1 -1); and we want to only keep one of
+                    // these.
+                    if (shift[0] + shift[1] + shift[2] < 0) {
+                        // drop shifts on the negative half-space
+                        return;
+                    }
+
+                    if ((shift[0] + shift[1] + shift[2] == 0) && (shift[2] < 0 || (shift[2] == 0 && shift[1] < 0))) {
+                        // drop shifts in the negative half plane or the negative
+                        // shift[1] axis. See below for a graphical representation:
+                        // we are keeping the shifts indicated with `O` and dropping
+                        // the ones indicated with `X`
+                        //
+                        //  O O O │ O O O
+                        //  O O O │ O O O
+                        //  O O O │ O O O
+                        // ─X─X─X─┼─O─O─O─
+                        //  X X X │ X X X
+                        //  X X X │ X X X
+                        //  X X X │ X X X
+                        return;
+                    }
                 }
             }
-        }
 
-        auto vector = points[second] - points[first] + shift.cartesian(cell_matrix);
-        auto distance2 = vector.dot(vector);
+            auto vector = points[second] - points[first] + shift.cartesian(cell_matrix);
+            auto distance2 = vector.dot(vector);
 
-        if (distance2 < cutoff2) {
-            auto index = neighbors.length();
-            neighbors.set_pair(index, first, second);
+            if (distance2 < cutoff2) {
+                auto index = neighbors.length();
+                neighbors.set_pair(index, first, second);
 
-            if (options.return_shifts) {
-                neighbors.set_shift(index, shift);
+                if (options.return_shifts) {
+                    neighbors.set_shift(index, shift);
+                }
+
+                if (options.return_distances) {
+                    neighbors.set_distance(index, std::sqrt(distance2));
+                }
+
+                if (options.return_vectors) {
+                    neighbors.set_vector(index, vector);
+                }
+
+                neighbors.increment_length();
             }
-
-            if (options.return_distances) {
-                neighbors.set_distance(index, std::sqrt(distance2));
-            }
-
-            if (options.return_vectors) {
-                neighbors.set_vector(index, vector);
-            }
-
-            neighbors.increment_length();
-        }
-    });
+        });
+    }
 
     if (options.sorted) {
         neighbors.sort();
@@ -138,6 +150,7 @@ CellList::CellList(BoundingBox box, double cutoff):
     n_search_({0, 0, 0}),
     cells_shape_({0, 0, 0}),
     box_(box) {
+    VESIN_PROFILE_SCOPE("vesin::cpu::CellList::CellList");
     auto distances_between_faces = box_.distances_between_faces();
 
     auto n_cells = Vector{
@@ -341,6 +354,7 @@ static scalar_t* alloc(scalar_t* ptr, size_t size, size_t new_size) {
 }
 
 void GrowableNeighborList::grow() {
+    VESIN_PROFILE_SCOPE("vesin::cpu::GrowableNeighborList::grow");
     auto new_size = neighbors.length * 2;
     if (new_size == 0) {
         new_size = 1;
@@ -372,6 +386,7 @@ void GrowableNeighborList::grow() {
 }
 
 void GrowableNeighborList::reset() {
+    VESIN_PROFILE_SCOPE("vesin::cpu::GrowableNeighborList::reset");
     // set all allocated data to zero
     auto size = this->neighbors.length;
     std::memset(this->neighbors.pairs, 0, size * sizeof(size_t[2]));
@@ -422,6 +437,7 @@ void GrowableNeighborList::reset() {
 }
 
 void GrowableNeighborList::sort() {
+    VESIN_PROFILE_SCOPE("vesin::cpu::GrowableNeighborList::sort");
     if (this->length() == 0) {
         return;
     }

@@ -3,6 +3,7 @@
 #include <string>
 
 #include "cpu_cell_list.hpp"
+#include "profiling.hpp"
 #include "vesin.h"
 #include "vesin_cuda.hpp"
 
@@ -68,7 +69,10 @@ extern "C" int vesin_neighbors(
     }
 
     try {
+        VESIN_PROFILE_SCOPE("vesin::vesin_neighbors");
+
         if (device.type == VesinCPU) {
+            VESIN_PROFILE_SCOPE("vesin::cpu::neighbors");
             auto matrix = vesin::Matrix{{{
                 {{box[0][0], box[0][1], box[0][2]}},
                 {{box[1][0], box[1][1], box[1][2]}},
@@ -83,6 +87,7 @@ extern "C" int vesin_neighbors(
                 *neighbors
             );
         } else if (device.type == VesinCUDA) {
+            VESIN_PROFILE_SCOPE("vesin::cuda::neighbors");
             vesin::cuda::neighbors(
                 points,
                 n_points,

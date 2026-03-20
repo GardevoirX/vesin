@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 
 #include <algorithm>
 #include <optional>
@@ -10,6 +11,7 @@
 #define NOMINMAX
 #include <gpulite/gpulite.hpp>
 
+#include "profiling.hpp"
 #include "vesin_cuda.hpp"
 
 using namespace vesin::cuda;
@@ -432,6 +434,8 @@ void vesin::cuda::neighbors(
     VesinNeighborList& neighbors
 ) {
     assert(neighbors.device.type == VesinCUDA);
+    VESIN_PROFILE_SCOPE("vesin::cuda::neighbors_impl");
+
     if (options.sorted) {
         throw std::runtime_error("CUDA implemented does not support sorted output yet");
     }
@@ -568,57 +572,72 @@ void vesin::cuda::neighbors(
         CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMalloc((void**)&extras->inv_box_brute, sizeof(double) * 9));
     }
 
-    auto* box_check_kernel = factory.create(
-        "mic_box_check",
-        CUDA_BRUTEFORCE_CODE,
-        "cuda_bruteforce.cu",
-        {"-std=c++17"}
-    );
-
     double* d_box_diag = extras->box_diag;
     double* d_inv_box_brute = extras->inv_box_brute;
-    std::vector<void*> box_check_args = {
-        static_cast<void*>(&d_box),
-        static_cast<void*>(&d_periodic),
-        static_cast<void*>(&options.cutoff),
-        static_cast<void*>(&d_cell_check),
-        static_cast<void*>(&d_box_diag),
-        static_cast<void*>(&d_inv_box_brute),
-    };
-
-    box_check_kernel->launch(dim3(1), dim3(32), 0, nullptr, box_check_args, false);
-
-    int32_t h_cell_check = 1;
-    CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(&h_cell_check, d_cell_check, sizeof(int32_t), cudaMemcpyDeviceToHost));
-
-    bool box_check_error = (h_cell_check & 1) != 0;
-    bool is_orthogonal = (h_cell_check & 2) != 0;
-
-    // Get box dimensions for auto algorithm selection
-    double h_box_diag[3];
-    CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(h_box_diag, d_box_diag, sizeof(double) * 3, cudaMemcpyDeviceToHost));
-    double min_box_dim = std::min({h_box_diag[0], h_box_diag[1], h_box_diag[2]});
-    bool cutoff_requires_cell_list = options.cutoff > min_box_dim / 2.0;
-
     bool use_cell_list;
-    switch (options.algorithm) {
-    case VesinBruteForce:
-        if (box_check_error) {
-            throw std::runtime_error("Invalid cutoff: too large for box dimensions");
+    bool box_check_error = false;
+    bool is_orthogonal = false;
+    {
+        VESIN_PROFILE_SCOPE("vesin::cuda::box_check_and_select");
+
+        auto* box_check_kernel = factory.create(
+            "mic_box_check",
+            CUDA_BRUTEFORCE_CODE,
+            "cuda_bruteforce.cu",
+            {"-std=c++17"}
+        );
+
+        std::vector<void*> box_check_args = {
+            static_cast<void*>(&d_box),
+            static_cast<void*>(&d_periodic),
+            static_cast<void*>(&options.cutoff),
+            static_cast<void*>(&d_cell_check),
+            static_cast<void*>(&d_box_diag),
+            static_cast<void*>(&d_inv_box_brute),
+        };
+
+        box_check_kernel->launch(dim3(1), dim3(32), 0, nullptr, box_check_args, false);
+
+        int32_t h_cell_check = 1;
+        CUDART_SAFE_CALL(
+            CUDART_INSTANCE.cudaMemcpy(
+                &h_cell_check, d_cell_check, sizeof(int32_t), cudaMemcpyDeviceToHost
+            )
+        );
+
+        box_check_error = (h_cell_check & 1) != 0;
+        is_orthogonal = (h_cell_check & 2) != 0;
+
+        // Get box dimensions for auto algorithm selection
+        double h_box_diag[3];
+        CUDART_SAFE_CALL(
+            CUDART_INSTANCE.cudaMemcpy(
+                h_box_diag, d_box_diag, sizeof(double) * 3, cudaMemcpyDeviceToHost
+            )
+        );
+        double min_box_dim = std::min({h_box_diag[0], h_box_diag[1], h_box_diag[2]});
+        bool cutoff_requires_cell_list = options.cutoff > min_box_dim / 2.0 && (min_box_dim > 1e-6);
+
+        switch (options.algorithm) {
+        case VesinBruteForce:
+            if (box_check_error) {
+                throw std::runtime_error("Invalid cutoff: too large for box dimensions");
+            }
+            use_cell_list = false;
+            break;
+        case VesinCellList:
+            use_cell_list = true;
+            break;
+        case VesinAutoAlgorithm:
+        default:
+            // Use cell list if cutoff > half box size, or for large/non-orthogonal systems
+            use_cell_list = (cutoff_requires_cell_list || !is_orthogonal || n_points >= 5000);
+            break;
         }
-        use_cell_list = false;
-        break;
-    case VesinCellList:
-        use_cell_list = true;
-        break;
-    case VesinAutoAlgorithm:
-    default:
-        // Use cell list if cutoff > half box size, or for large/non-orthogonal systems
-        use_cell_list = cutoff_requires_cell_list || !is_orthogonal || n_points >= 5000;
-        break;
     }
 
     if (use_cell_list) {
+        VESIN_PROFILE_SCOPE("vesin::cuda::cell_list");
         NVTX_PUSH("cell_list_total");
 
         NVTX_PUSH("ensure_buffers");
@@ -792,6 +811,7 @@ void vesin::cuda::neighbors(
     }
 
     if (!use_cell_list) {
+        VESIN_PROFILE_SCOPE("vesin::cuda::brute_force");
         NVTX_PUSH("brute_force_total");
 
         size_t THREADS_PER_BLOCK = 128;
@@ -958,39 +978,42 @@ void vesin::cuda::neighbors(
         NVTX_POP(); // brute_force_total
     }
 
-    NVTX_PUSH("async_copy_and_sync");
+    {
+        VESIN_PROFILE_SCOPE("vesin::cuda::async_copy_and_sync");
+        NVTX_PUSH("async_copy_and_sync");
 
-    CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpyAsync(
-        extras->pinned_length_ptr,
-        d_pair_counter,
-        sizeof(size_t),
-        cudaMemcpyDeviceToHost,
-        nullptr
-    ));
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpyAsync(
+            extras->pinned_length_ptr,
+            d_pair_counter,
+            sizeof(size_t),
+            cudaMemcpyDeviceToHost,
+            nullptr
+        ));
 
-    CUDART_SAFE_CALL(CUDART_INSTANCE.cudaDeviceSynchronize());
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaDeviceSynchronize());
 
-    // Check for overflow
-    int h_overflow_flag = 0;
-    CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(
-        &h_overflow_flag,
-        d_overflow_flag,
-        sizeof(int),
-        cudaMemcpyDeviceToHost
-    ));
+        // Check for overflow
+        int h_overflow_flag = 0;
+        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(
+            &h_overflow_flag,
+            d_overflow_flag,
+            sizeof(int),
+            cudaMemcpyDeviceToHost
+        ));
 
-    if (h_overflow_flag != 0) {
-        throw std::runtime_error(
-            "The number of neighbor pairs exceeds the maximum capacity of " +
-            std::to_string(max_pairs) + " (max_pairs_per_point=" +
-            std::to_string(max_pairs_per_point) + "; n_points=" +
-            std::to_string(n_points) + "). " +
-            "Consider reducing the cutoff distance, or explicitly setting " +
-            "VESIN_CUDA_MAX_PAIRS_PER_POINT as an environment variable."
-        );
+        if (h_overflow_flag != 0) {
+            throw std::runtime_error(
+                "The number of neighbor pairs exceeds the maximum capacity of " +
+                std::to_string(max_pairs) + " (max_pairs_per_point=" +
+                std::to_string(max_pairs_per_point) + "; n_points=" +
+                std::to_string(n_points) + "). " +
+                "Consider reducing the cutoff distance, or explicitly setting " +
+                "VESIN_CUDA_MAX_PAIRS_PER_POINT as an environment variable."
+            );
+        }
+
+        neighbors.length = *extras->pinned_length_ptr;
+
+        NVTX_POP();
     }
-
-    neighbors.length = *extras->pinned_length_ptr;
-
-    NVTX_POP();
 }

@@ -4,6 +4,7 @@
 
 #include <vesin.h>
 
+#include "../../vesin/src/profiling.hpp"
 #include "vesin_torch.hpp"
 
 using namespace vesin_torch;
@@ -75,229 +76,259 @@ std::vector<torch::Tensor> NeighborListHolder::compute(
     std::string quantities,
     bool copy
 ) {
-    // check input data
-    if (points.device() != box.device()) {
-        // clang-format off
-        C10_THROW_ERROR(ValueError,
-            "expected `points` and `box` to have the same device, got " +
-            points.device().str() + " and " + box.device().str()
-        );
-        // clang-format on
-    }
-    auto vesin_device = torch_to_vesin_device(points.device());
+    VESIN_PROFILE_SCOPE("vesin_torch::NeighborListHolder::compute");
 
-    if (points.scalar_type() != box.scalar_type()) {
-        // clang-format off
-        C10_THROW_ERROR(ValueError,
-            std::string("expected `points` and `box` to have the same dtype, got ") +
-            torch::toString(points.scalar_type()) + " and " +
-            torch::toString(box.scalar_type())
-        );
-        // clang-format on
-    }
-    if (points.scalar_type() != torch::kFloat64) {
-        C10_THROW_ERROR(ValueError, "only float64 is supported for `points` and `box`");
-    }
+    VesinDevice vesin_device;
+    size_t n_points = 0;
+    bool return_shifts = false;
+    bool return_distances = false;
+    bool return_vectors = false;
+    VesinOptions options{};
 
-    if (points.sizes().size() != 2 || points.size(1) != 3) {
-        std::ostringstream oss;
-        oss << "`points` must be n x 3 tensor, but the shape is " << points.sizes();
-        C10_THROW_ERROR(ValueError, oss.str());
-    }
+    {
+        VESIN_PROFILE_SCOPE("vesin_torch::prepare_inputs");
 
-    if (box.sizes().size() != 2 || box.size(0) != 3 || box.size(1) != 3) {
-        std::ostringstream oss;
-        oss << "`box` must be 3 x 3 tensor, but the shape is " << points.sizes();
-        C10_THROW_ERROR(ValueError, oss.str());
-    }
+        // check input data
+        if (points.device() != box.device()) {
+            // clang-format off
+            C10_THROW_ERROR(ValueError,
+                "expected `points` and `box` to have the same device, got " +
+                points.device().str() + " and " + box.device().str()
+            );
+            // clang-format on
+        }
+        vesin_device = torch_to_vesin_device(points.device());
 
-    if (points.device() != periodic.device()) {
-        periodic = periodic.to(points.device());
-    }
+        if (points.scalar_type() != box.scalar_type()) {
+            // clang-format off
+            C10_THROW_ERROR(ValueError,
+                std::string("expected `points` and `box` to have the same dtype, got ") +
+                torch::toString(points.scalar_type()) + " and " +
+                torch::toString(box.scalar_type())
+            );
+            // clang-format on
+        }
+        if (points.scalar_type() != torch::kFloat64) {
+            C10_THROW_ERROR(ValueError, "only float64 is supported for `points` and `box`");
+        }
 
-    if (periodic.scalar_type() != torch::kBool) {
-        C10_THROW_ERROR(ValueError, "`periodic` must be a tensor of bool");
-    }
+        if (points.sizes().size() != 2 || points.size(1) != 3) {
+            std::ostringstream oss;
+            oss << "`points` must be n x 3 tensor, but the shape is " << points.sizes();
+            C10_THROW_ERROR(ValueError, oss.str());
+        }
 
-    if (periodic.sizes().size() == 0) {
-        periodic = periodic.repeat({3});
-    }
+        if (box.sizes().size() != 2 || box.size(0) != 3 || box.size(1) != 3) {
+            std::ostringstream oss;
+            oss << "`box` must be 3 x 3 tensor, but the shape is " << points.sizes();
+            C10_THROW_ERROR(ValueError, oss.str());
+        }
 
-    if (periodic.sizes().size() != 1 || periodic.size(0) != 3) {
-        C10_THROW_ERROR(ValueError, "`periodic` must be either a single bool or a tensor of 3 bool");
-    }
+        if (points.device() != periodic.device()) {
+            periodic = periodic.to(points.device());
+        }
 
-    // create calculation options
-    auto n_points = static_cast<size_t>(points.size(0));
+        if (periodic.scalar_type() != torch::kBool) {
+            C10_THROW_ERROR(ValueError, "`periodic` must be a tensor of bool");
+        }
 
-    // reset vesin data if device changed
-    if (data_->device.type != VesinUnknownDevice && data_->device.type != vesin_device.type) {
-        vesin_free(data_);
-        std::memset(data_, 0, sizeof(VesinNeighborList));
-    }
+        if (periodic.sizes().size() == 0) {
+            periodic = periodic.repeat({3});
+        }
 
-    auto return_shifts = quantities.find('S') != std::string::npos;
-    if (box.requires_grad()) {
-        return_shifts = true;
-    }
+        if (periodic.sizes().size() != 1 || periodic.size(0) != 3) {
+            C10_THROW_ERROR(ValueError, "`periodic` must be either a single bool or a tensor of 3 bool");
+        }
 
-    auto return_distances = quantities.find('d') != std::string::npos;
-    auto return_vectors = quantities.find('D') != std::string::npos;
-    if ((points.requires_grad() || box.requires_grad()) &&
-        (return_distances || return_vectors)) {
-        // gradients requires both distances & vectors data to be present
-        return_distances = true;
-        return_vectors = true;
-    }
+        // create calculation options
+        n_points = static_cast<size_t>(points.size(0));
 
-    VesinAlgorithm algorithm = VesinAutoAlgorithm;
-    if (algorithm_ == "auto") {
-        algorithm = VesinAutoAlgorithm;
-    } else if (algorithm_ == "brute_force") {
-        algorithm = VesinBruteForce;
-    } else if (algorithm_ == "cell_list") {
-        algorithm = VesinCellList;
-    } else {
-        throw std::runtime_error(
-            "unknown algorithm '" + algorithm_ + "', expected one of "
-                                                 "'auto', 'brute_force', or 'cell_list'"
-        );
-    }
+        // reset vesin data if device changed
+        if (data_->device.type != VesinUnknownDevice && data_->device.type != vesin_device.type) {
+            vesin_free(data_);
+            std::memset(data_, 0, sizeof(VesinNeighborList));
+        }
 
-    auto options = VesinOptions{
-        /*cutoff=*/this->cutoff_,
-        /*full=*/this->full_list_,
-        /*sorted=*/this->sorted_,
-        /*algorithm=*/algorithm,
-        /*return_shifts=*/return_shifts,
-        /*return_distances=*/return_distances,
-        /*return_vectors=*/return_vectors,
-    };
+        return_shifts = quantities.find('S') != std::string::npos;
+        if (box.requires_grad()) {
+            return_shifts = true;
+        }
 
-    if (!points.is_contiguous()) {
-        points = points.contiguous();
-    }
+        return_distances = quantities.find('d') != std::string::npos;
+        return_vectors = quantities.find('D') != std::string::npos;
+        if ((points.requires_grad() || box.requires_grad()) &&
+            (return_distances || return_vectors)) {
+            // gradients requires both distances & vectors data to be present
+            return_distances = true;
+            return_vectors = true;
+        }
 
-    if (!box.is_contiguous()) {
-        box = box.contiguous();
+        VesinAlgorithm algorithm = VesinAutoAlgorithm;
+        if (algorithm_ == "auto") {
+            algorithm = VesinAutoAlgorithm;
+        } else if (algorithm_ == "brute_force") {
+            algorithm = VesinBruteForce;
+        } else if (algorithm_ == "cell_list") {
+            algorithm = VesinCellList;
+        } else {
+            throw std::runtime_error(
+                "unknown algorithm '" + algorithm_ + "', expected one of "
+                                                     "'auto', 'brute_force', or 'cell_list'"
+            );
+        }
+
+        options = VesinOptions{
+            /*cutoff=*/this->cutoff_,
+            /*full=*/this->full_list_,
+            /*sorted=*/this->sorted_,
+            /*algorithm=*/algorithm,
+            /*return_shifts=*/return_shifts,
+            /*return_distances=*/return_distances,
+            /*return_vectors=*/return_vectors,
+        };
+
+        if (!points.is_contiguous()) {
+            points = points.contiguous();
+        }
+
+        if (!box.is_contiguous()) {
+            box = box.contiguous();
+        }
     }
 
     const char* error_message = nullptr;
-    auto status = vesin_neighbors(
-        reinterpret_cast<const double (*)[3]>(points.data_ptr<double>()),
-        n_points,
-        reinterpret_cast<const double (*)[3]>(box.data_ptr<double>()),
-        periodic.data_ptr<bool>(),
-        vesin_device,
-        options,
-        data_,
-        &error_message
-    );
+    int status = EXIT_SUCCESS;
+    {
+        VESIN_PROFILE_SCOPE("vesin_torch::vesin_neighbors");
+        status = vesin_neighbors(
+            reinterpret_cast<const double (*)[3]>(points.data_ptr<double>()),
+            n_points,
+            reinterpret_cast<const double (*)[3]>(box.data_ptr<double>()),
+            periodic.data_ptr<bool>(),
+            vesin_device,
+            options,
+            data_,
+            &error_message
+        );
+    }
 
     if (status != EXIT_SUCCESS) {
         throw std::runtime_error(std::string("failed to compute neighbors: ") + error_message);
     }
 
-    // wrap vesin data in tensors
-    auto size_t_options =
-        torch::TensorOptions().device(vesin_to_torch_device(data_->device));
-    if (sizeof(size_t) == sizeof(uint32_t)) {
-        size_t_options = size_t_options.dtype(torch::kUInt32);
-    } else if (sizeof(size_t) == sizeof(uint64_t)) {
-        size_t_options = size_t_options.dtype(torch::kUInt64);
-    } else {
-        C10_THROW_ERROR(ValueError, "could not determine torch dtype matching size_t");
-    }
-
-    int64_t length = static_cast<int64_t>(data_->length);
-    auto pairs = torch::from_blob(data_->pairs, {length, 2}, size_t_options)
-                     .to(torch::kInt64);
-
+    torch::Tensor pairs;
     auto shifts = torch::Tensor();
-    if (data_->shifts != nullptr) {
-        auto int32_options = torch::TensorOptions()
-                                 .device(vesin_to_torch_device(data_->device))
-                                 .dtype(torch::kInt32);
-
-        shifts = torch::from_blob(data_->shifts, {length, 3}, int32_options);
-
-        if (copy) {
-            shifts = shifts.clone();
-        }
-    }
-
-    auto double_options = torch::TensorOptions()
-                              .device(vesin_to_torch_device(data_->device))
-                              .dtype(torch::kDouble);
-
     auto distances = torch::Tensor();
-    if (data_->distances != nullptr) {
-        distances = torch::from_blob(data_->distances, {length}, double_options);
-
-        if (copy) {
-            distances = distances.clone();
-        }
-    }
-
     auto vectors = torch::Tensor();
-    if (data_->vectors != nullptr) {
-        vectors = torch::from_blob(data_->vectors, {length, 3}, double_options);
+    {
+        VESIN_PROFILE_SCOPE("vesin_torch::wrap_outputs");
 
-        if (copy) {
-            vectors = vectors.clone();
-        }
-    }
-
-    // handle autograd
-    if ((return_distances || return_vectors)) {
-        // we use optional for these three because otherwise torch autograd
-        // tries to access data inside the undefined `torch::Tensor()`.
-        torch::optional<torch::Tensor> shifts_optional = torch::nullopt;
-        if (shifts.defined()) {
-            shifts_optional = shifts;
-        }
-
-        torch::optional<torch::Tensor> distances_optional = torch::nullopt;
-        if (distances.defined()) {
-            distances_optional = distances;
-        }
-
-        torch::optional<torch::Tensor> vectors_optional = torch::nullopt;
-        if (vectors.defined()) {
-            vectors_optional = vectors;
-        }
-
-        auto outputs =
-            AutogradNeighbors::apply(points, box, periodic, pairs, shifts_optional, distances_optional, vectors_optional);
-
-        if (return_distances && return_vectors) {
-            distances = outputs[0];
-            vectors = outputs[1];
-        } else if (return_distances) {
-            distances = outputs[0];
+        // wrap vesin data in tensors
+        auto size_t_options =
+            torch::TensorOptions().device(vesin_to_torch_device(data_->device));
+        if (sizeof(size_t) == sizeof(uint32_t)) {
+            size_t_options = size_t_options.dtype(torch::kUInt32);
+        } else if (sizeof(size_t) == sizeof(uint64_t)) {
+            size_t_options = size_t_options.dtype(torch::kUInt64);
         } else {
-            assert(return_vectors);
-            vectors = outputs[0];
+            C10_THROW_ERROR(ValueError, "could not determine torch dtype matching size_t");
+        }
+
+        int64_t length = static_cast<int64_t>(data_->length);
+        pairs = torch::from_blob(data_->pairs, {length, 2}, size_t_options)
+                    .to(torch::kInt64);
+
+        if (data_->shifts != nullptr) {
+            auto int32_options = torch::TensorOptions()
+                                     .device(vesin_to_torch_device(data_->device))
+                                     .dtype(torch::kInt32);
+
+            shifts = torch::from_blob(data_->shifts, {length, 3}, int32_options);
+
+            if (copy) {
+                shifts = shifts.clone();
+            }
+        }
+
+        auto double_options = torch::TensorOptions()
+                                  .device(vesin_to_torch_device(data_->device))
+                                  .dtype(torch::kDouble);
+
+        if (data_->distances != nullptr) {
+            distances = torch::from_blob(data_->distances, {length}, double_options);
+
+            if (copy) {
+                distances = distances.clone();
+            }
+        }
+
+        if (data_->vectors != nullptr) {
+            vectors = torch::from_blob(data_->vectors, {length, 3}, double_options);
+
+            if (copy) {
+                vectors = vectors.clone();
+            }
         }
     }
 
-    // assemble the output
+    {
+        VESIN_PROFILE_SCOPE("vesin_torch::autograd");
+
+        // handle autograd
+        if ((return_distances || return_vectors)) {
+            // we use optional for these three because otherwise torch autograd
+            // tries to access data inside the undefined `torch::Tensor()`.
+            torch::optional<torch::Tensor> shifts_optional = torch::nullopt;
+            if (shifts.defined()) {
+                shifts_optional = shifts;
+            }
+
+            torch::optional<torch::Tensor> distances_optional = torch::nullopt;
+            if (distances.defined()) {
+                distances_optional = distances;
+            }
+
+            torch::optional<torch::Tensor> vectors_optional = torch::nullopt;
+            if (vectors.defined()) {
+                vectors_optional = vectors;
+            }
+
+            auto outputs =
+                AutogradNeighbors::apply(points, box, periodic, pairs, shifts_optional, distances_optional, vectors_optional);
+
+            if (return_distances && return_vectors) {
+                distances = outputs[0];
+                vectors = outputs[1];
+            } else if (return_distances) {
+                distances = outputs[0];
+            } else {
+                assert(return_vectors);
+                vectors = outputs[0];
+            }
+        }
+    }
+
     auto output = std::vector<torch::Tensor>();
-    for (auto c : quantities) {
-        if (c == 'i') {
-            output.push_back(pairs.index({torch::indexing::Slice(), 0}));
-        } else if (c == 'j') {
-            output.push_back(pairs.index({torch::indexing::Slice(), 1}));
-        } else if (c == 'P') {
-            output.push_back(pairs);
-        } else if (c == 'S') {
-            output.push_back(shifts);
-        } else if (c == 'd') {
-            output.push_back(distances);
-        } else if (c == 'D') {
-            output.push_back(vectors);
-        } else {
-            C10_THROW_ERROR(ValueError, "unexpected character in `quantities`: " + std::string(1, c));
+    {
+        VESIN_PROFILE_SCOPE("vesin_torch::assemble_output");
+
+        // assemble the output
+        for (auto c : quantities) {
+            if (c == 'i') {
+                output.push_back(pairs.index({torch::indexing::Slice(), 0}));
+            } else if (c == 'j') {
+                output.push_back(pairs.index({torch::indexing::Slice(), 1}));
+            } else if (c == 'P') {
+                output.push_back(pairs);
+            } else if (c == 'S') {
+                output.push_back(shifts);
+            } else if (c == 'd') {
+                output.push_back(distances);
+            } else if (c == 'D') {
+                output.push_back(vectors);
+            } else {
+                C10_THROW_ERROR(ValueError, "unexpected character in `quantities`: " + std::string(1, c));
+            }
         }
     }
 
@@ -362,6 +393,7 @@ std::vector<torch::Tensor> AutogradNeighbors::forward(
     torch::optional<torch::Tensor> distances,
     torch::optional<torch::Tensor> vectors
 ) {
+    VESIN_PROFILE_SCOPE("vesin_torch::AutogradNeighbors::forward");
     auto shifts_tensor = shifts.value_or(torch::Tensor());
     auto distances_tensor = distances.value_or(torch::Tensor());
     auto vectors_tensor = vectors.value_or(torch::Tensor());
@@ -391,6 +423,7 @@ std::vector<torch::Tensor> AutogradNeighbors::backward(
     torch::autograd::AutogradContext* ctx,
     std::vector<torch::Tensor> outputs_grad
 ) {
+    VESIN_PROFILE_SCOPE("vesin_torch::AutogradNeighbors::backward");
     auto saved_variables = ctx->get_saved_variables();
     const auto& points = saved_variables[0];
     const auto& box = saved_variables[1];
